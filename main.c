@@ -38,7 +38,7 @@ typedef struct _seq_op_t
 
 void seq_op_t_init(seq_op_t *seq_o, const int n);
 int seq_op_t_have_no_zeroes(seq_op_t *seq_o, const int n);
-void sequentate(seq_op_t *seq_o, const int n, const int sock_fd, const int binaryf);
+void sequentate(seq_op_t *seq_o, const int n, const int sock_fd, const int binaryf, const int fastf);
 void *new_connection(void *args);
 
 int main()
@@ -91,13 +91,16 @@ int main()
     return 0;
 }
 
+
+#define RECV_BUF_SIZE 1024
 void *new_connection(void *args)
 {
-    char buf[1025];
+    char buf[RECV_BUF_SIZE + 1];
 
     seq_op_t seq_o[SEQ_NUM];
     seq_op_t_init(seq_o, SEQ_NUM);
     int telnet_binary = 0;
+    int telnet_fast = 0;
     int sock = (int)(intptr_t)args;
 
     while(1)
@@ -106,9 +109,9 @@ void *new_connection(void *args)
         char command[16];
         command[0] = 0;
 
-        bytes_read = recv(sock, buf, 1024, 0);
+        bytes_read = recv(sock, buf, 1024, MSG_NOSIGNAL);
         if(bytes_read <= 0)
-               break;
+               break;//Disconnected
         buf[bytes_read] = 0;
         printf("recived(%d): %s ", bytes_read, buf);
         for (int i = 0; i < bytes_read; i ++)
@@ -134,9 +137,10 @@ void *new_connection(void *args)
             buf[0] = TN_IAC;
             buf[1] = TN_WILL;
             buf[2] = TN_DATA_BIN;
-            send(sock, buf, 3, MSG_NOSIGNAL);
+            if(send(sock, buf, 3, MSG_NOSIGNAL) != 3)
+                break;//Disconnected
 
-            bytes_read = recv(sock, buf, 1024, 0);
+            bytes_read = recv(sock, buf, 1024, MSG_NOSIGNAL);
             printf("rec %d bytes:", bytes_read);
             for (int i = 0; i < bytes_read; i ++)
                 printf(" %02x", (unsigned char)buf[i]);
@@ -144,10 +148,41 @@ void *new_connection(void *args)
 
             buf[0] = TN_IAC;
             buf[1] = TN_DATA_MARK;
-            send(sock, buf, 2, MSG_NOSIGNAL);
+            if(send(sock, buf, 2, MSG_NOSIGNAL) != 2)
+                break;//Disconnected
             telnet_binary = 1;
 
-            send(sock, "OK\n\r", 4, MSG_NOSIGNAL);
+            if(send(sock, "OK\n\r", 4, MSG_NOSIGNAL) != 4)
+                break;//Disconnected
+            continue;
+        }
+        else if(strncmp("fast", buf, 4) == 0)
+        {
+            if(telnet_binary)
+            {
+                telnet_fast = 1;
+                send(sock, "OK\n\r", 4, MSG_NOSIGNAL);
+            }
+            else
+            {
+                const char *str = "Fast mode is only possible with binary\n\r";
+                fprintf(stderr, "%s", str);
+                send(sock, str, strlen(str), MSG_NOSIGNAL);
+            }
+            continue;
+        }
+        else if(strncmp("help", buf, 4) == 0)
+        {
+            const char *str = "\n\rAvailable commands:\n\rhelp \t\t- print this\n\r" \
+            "seq1 x y\t- set sequence1 start number x and step y\n\r" \
+            "seq2 x y\t- set sequence2 start number x and step y\n\r" \
+            "seq3 x y\t- set sequence2 start number x and step y\n\r" \
+            "export seq\t- send sequence to telnet\n\r" \
+            "close\t\t- close telnet and server\n\r" \
+            "exit\t\t- close telnet\n\r"
+            "binary\t\t- set telnet mode to binary and sending when export in binary\n\r" \
+            "fast\t\t- set sending mode to fast by chunks available in binary mode\n\r\r\n";
+            send(sock, str, strlen(str), MSG_NOSIGNAL);
             continue;
         }
 
@@ -184,7 +219,7 @@ void *new_connection(void *args)
             }
             /*
             */
-            sequentate(seq_o, SEQ_NUM, sock, telnet_binary);
+            sequentate(seq_o, SEQ_NUM, sock, telnet_binary, telnet_fast);
         }
         else
         {
@@ -194,6 +229,7 @@ void *new_connection(void *args)
         }
     }
     close(sock);
+    printf("Disconnected\n");
     return (void*)1;
 }
 
@@ -266,29 +302,56 @@ uint64_t seq_op_t_iterate(seq_op_t *seq_o, const int n)
     sock_fd - сокет
     binary - флаг передачи в сокет двоичных данных
 */
-void sequentate(seq_op_t *seq_o, const int n, const int sock_fd, const int binaryf)
+void sequentate(seq_op_t *seq_o, const int n, const int sock_fd, const int binaryf, const int fastf)
 {
-	for (;;)
-	{
-		uint64_t value = seq_op_t_iterate(seq_o, n);
-		int writed;
-
-        if(binaryf)
+    if(binaryf)
+    {
+        if(fastf)
         {
-            char buf[10];
-            *((uint64_t*)buf) = value;
-            buf[8] = ',';
-            buf[9] = ' ';
-            writed = send(sock_fd, buf, 10, MSG_NOSIGNAL);
-            if(10 != writed)
+            char buf[8*1024];
+            for(int i;;)
             {
-                perror("10 != writed **** disconecting\n");
-                break;
+                i = 0;
+                for(; i < 8*1024; i += 10)
+                {
+                    uint64_t value = seq_op_t_iterate(seq_o, n);
+                    *((uint64_t*)(buf + i)) = value;
+                    buf[i + 8] = ',';
+                    buf[i + 9] = ' ';
+                }
+                int writed = send(sock_fd, buf, i, MSG_NOSIGNAL);
+                if(i != writed)
+                {
+                    perror("i != writed **** disconecting\n");
+                    break;
+                }
             }
         }
         else
         {
-            char buf[32];/*32 > log10(2^64)==19.2*/
+            char buf[10];
+            for(;;)
+            {
+                uint64_t value = seq_op_t_iterate(seq_o, n);
+                *((uint64_t*)buf) = value;
+                buf[8] = ',';
+                buf[9] = ' ';
+                int writed = send(sock_fd, buf, 10, MSG_NOSIGNAL);
+                if(10 != writed)
+                {
+                    perror("10 != writed **** disconecting\n");
+                    break;
+                }
+                usleep(1000*10);
+            }
+        }
+    }
+    else
+    {
+        char buf[32];/*32 > log10(2^64)==19.2*/
+        for(;;)
+        {
+            uint64_t value = seq_op_t_iterate(seq_o, n);
             sprintf(buf, "%lu, ", value);
             size_t buf_sz = strlen(buf);
             int writed = send(sock_fd, buf, buf_sz, MSG_NOSIGNAL);
@@ -297,8 +360,7 @@ void sequentate(seq_op_t *seq_o, const int n, const int sock_fd, const int binar
                 perror("buf_sz != writed **** disconecting\n");
                 break;
             }
+            usleep(1000*10);
         }
-        
-        usleep(1000*10);
-	}
+    }
 }

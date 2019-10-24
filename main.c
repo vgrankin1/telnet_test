@@ -17,6 +17,7 @@ Telnet commands
 */
 #define TN_IAC          0xFF     /*Interpret as Command*/
 #define TN_WILL         0xFB
+#define TN_WONT         0xFC
 #define TN_DATA_MARK    0xF2
 #define TN_DATA_BIN     0x00
 
@@ -95,7 +96,7 @@ int main()
 #define RECV_BUF_SIZE 1024
 void *new_connection(void *args)
 {
-    char buf[RECV_BUF_SIZE + 1];
+    unsigned char buf[RECV_BUF_SIZE + 1];
 
     seq_op_t seq_o[SEQ_NUM];
     seq_op_t_init(seq_o, SEQ_NUM);
@@ -118,6 +119,15 @@ void *new_connection(void *args)
             printf(" %02x", (unsigned char)buf[i]);
         printf("\n");
 
+        if(buf[0] == TN_IAC)//telnet command recieved
+        {
+            const char *str = "telnet commands igonring\n\r";
+            printf("%s", str);
+            buf[1] = TN_WONT;/*we will not execute the telnet command, send it back*/
+            send(sock, buf, 3, MSG_NOSIGNAL);
+            send(sock, str, strlen(str), MSG_NOSIGNAL);
+            continue;
+        }
         if(strncmp("close", buf, 5) == 0)
         {
             printf("#close recived\n");
